@@ -1,0 +1,5 @@
+{
+  "devDependencies": {
+    "@types/offscreen-canvas": "^0.1.5"
+  }
+}
