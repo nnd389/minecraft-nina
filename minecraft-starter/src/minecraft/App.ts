@@ -70,7 +70,7 @@ export class MinecraftAnimation extends CanvasAnimation {
   private wolfMesh: Mesh | null = null;
   private wolfLoader: CLoader | null = null;
   private mobAnimationTime: number = 0;
-  private readonly WOLF_FACING_OFFSET = (3 * Math.PI) / 2;
+  private readonly WOLF_FACING_OFFSET = (1 * Math.PI) / 2;
   
 
   /* Global Rendering Info */
@@ -393,7 +393,7 @@ export class MinecraftAnimation extends CanvasAnimation {
   // rayIntersectAABB will be for enemy combat, 
   // if you click on an enemies bounding box, then you subtract one health point
   // consider deleting rayintersectaabb if this is imlplemented elsewhere
-  private rayIntersectsAABB(rayOrigin: Vec3, rayDir: Vec3, boxMin: Vec3, boxMax: Vec3): boolean{
+  private rayIntersectsAABB(rayOrigin: Vec3, rayDir: Vec3, boxMin: Vec3, boxMax: Vec3): number | null{
     let tmin = -Infinity;
     let tmax = Infinity;
     const axes = ['x', 'y', 'z'] as const;
@@ -405,7 +405,7 @@ export class MinecraftAnimation extends CanvasAnimation {
       const max = boxMax[axis];
 
       if (Math.abs(d) < 1e-6){
-        if (o < min || o > max) return false;
+        if (o < min || o > max) return null;
       } else {
         let t1 = (min-o) / d;
         let t2 = (max-o) / d;
@@ -414,52 +414,86 @@ export class MinecraftAnimation extends CanvasAnimation {
         tmin = Math.max(tmin, t1);
         tmax = Math.min(tmax, t2);
 
-        if (tmin > tmax) return false;
+        if (tmin > tmax) return null;
       }
     }
-    return tmax >=0;
+    if (tmax < 0) return null;
+    return Math.max(0, tmin);
   }
 
   public attack(): void {
+    if (this.gui.isInventoryOpen()) {
+      return;
+    }
     const rayOrigin = this.playerPosition;
     const rayDir = this.gui.getCamera().forward().copy().normalize();
-    const reach = 3.0; // how far the player can hit - tweak this
+    const reach = 300.0;
+    const mobRadius = 300;
+    const mobHeight = 300;
 
-    for (const mob of this.mobs){
-      const halfSize = 10;
-      const height = 10; // for determining bounding box, FIX
+    type MobRef = { mob: Mob; container: Mob[] };
+    const mobRefs: MobRef[] = this.mobs.map((mob) => ({ mob, container: this.mobs }));
+    for (const chunk of this.chunks.values()) {
+      const chunkMobs = chunk.getMobs();
+      for (const mob of chunkMobs) {
+        mobRefs.push({ mob, container: chunkMobs });
+      }
+    }
+
+    let bestTarget: MobRef | null = null;
+    let bestT = Infinity;
+    for (const candidate of mobRefs){
+      const mob = candidate.mob;
 
       const boxMin = new Vec3([
-        mob.center.x - halfSize, 
-        mob.center.y, 
-        mob.center.z - halfSize
+        mob.center.x - mobRadius,
+        mob.center.y - mobHeight,
+        mob.center.z - mobRadius
       ]);
 
       const boxMax = new Vec3([
-        mob.center.x + halfSize, 
-        mob.center.y + halfSize, 
-        mob.center.z + height
+        mob.center.x + mobRadius,
+        mob.center.y,
+        mob.center.z + mobRadius
       ]);
 
-      if (this.rayIntersectsAABB(rayOrigin, rayDir, boxMin, boxMax)){
+      const t = this.rayIntersectsAABB(rayOrigin, rayDir, boxMin, boxMax);
+      if (t === null || t > reach) continue;
 
-        //Check distance so you cant hit really far
-        const dx = mob.center.x - rayOrigin.x; //[x, z, y]
-        const dy = mob.center.y - rayOrigin.y; 
-        const dz = mob.center.z - rayOrigin.z;
-        const dist = Math.sqrt(dx*dx + dz*dz);
-        if (dist > reach) continue;
-
-        mob.health -= 1; 
-        console.log("Hit Mob! Mob health is: ", mob.health);
-
-        if (mob.health <= 0){
-          console.log("Mob dies!");
-          this.mobs = this.mobs.filter(m => m !== mob); // delete mob?
-        }
-
-        break; // only one mob per click?
+      if (t < bestT) {
+        bestT = t;
+        bestTarget = candidate;
       }
+    }
+
+    if (!bestTarget) return;
+
+    bestTarget.mob.health -= 1;
+    console.log("Hit Mob! Mob health is: ", bestTarget.mob.health);
+
+    if (bestTarget.mob.health <= 0){
+      console.log("Mob dies!");
+      bestTarget.mob.dead = true;
+
+      // remove from global mobs
+      const globalIdx = this.mobs.indexOf(bestTarget.mob);
+      if (globalIdx >= 0) {
+        this.mobs.splice(globalIdx, 1);
+      }
+
+      // also remove from chunks
+      for (const chunk of this.chunks.values()) {
+        const mobs = chunk.getMobs();
+        const idx = mobs.indexOf(bestTarget.mob);
+        if (idx >= 0) {
+          mobs.splice(idx, 1);
+        }
+      }
+
+      // const idx = bestTarget.container.indexOf(bestTarget.mob);
+      // if (idx >= 0) {
+      //   bestTarget.container.splice(idx, 1);
+      // }
     }
   }
 
@@ -966,6 +1000,8 @@ export class MinecraftAnimation extends CanvasAnimation {
 
     gl.bindFramebuffer(gl.FRAMEBUFFER, null); // null is the default frame buffer
     this.drawScene(0, 0, 1280, 960);
+
+    
     
     this.drawHUD();
   }
@@ -1013,18 +1049,22 @@ export class MinecraftAnimation extends CanvasAnimation {
         allMobs.push(...chunk.getMobs());
       }
 
+      // filter out dead mobs
+      const aliveMobs = allMobs.filter(m => !m.dead);
+
+      
+
+
       // simulate mobs on full list
-      this.updateMobVelocities(allMobs);
-      this.updateMobPositions(allMobs);
+      this.updateMobVelocities(aliveMobs);
+      this.updateMobPositions(aliveMobs);
 
       // render
       const positions: Vec3[] = [];
       const rotations: Quat[] = [];
-      for (const mob of allMobs){
+      for (const mob of aliveMobs){
         positions.push(mob.center);
-        //const q = new Quat().setIdentity();
         const q = Quat.fromAxisAngle(new Vec3([0, 1, 0]), mob.orientation + this.WOLF_FACING_OFFSET);
-        
         rotations.push(q);
       }
       this.drawMesh(this.wolfMesh, positions, rotations);
@@ -1441,7 +1481,7 @@ export class MinecraftAnimation extends CanvasAnimation {
   }
 
 
-  
+
   private computeAnimatedVertexPositions(mesh: Mesh, time: number, clipIndex: number): Float32Array {
     const geo = mesh.geometry;
     const vertexCount = geo.position.count;

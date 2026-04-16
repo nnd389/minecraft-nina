@@ -29,6 +29,7 @@ export class Mob {
     public health: number;
     public animTime: number = 0;
     public animationSpeed: number = 1.0;
+    public dead: boolean = false;
 
     constructor(kind : mobTypeEnum, center : Vec3, orientation : number) {
         this.kind = kind;
