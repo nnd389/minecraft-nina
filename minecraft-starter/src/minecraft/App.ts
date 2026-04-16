@@ -69,6 +69,8 @@ export class MinecraftAnimation extends CanvasAnimation {
   private meshRenderPasses: Map<Mesh, { pass: RenderPass, indexCount: number }> = new Map();
   private wolfMesh: Mesh | null = null;
   private wolfLoader: CLoader | null = null;
+  private mobAnimationTime: number = 0;
+  private readonly WOLF_FACING_OFFSET = (3 * Math.PI) / 2;
   
 
   /* Global Rendering Info */
@@ -187,7 +189,8 @@ export class MinecraftAnimation extends CanvasAnimation {
     this.backgroundColor = new Vec4([0.0, 0.37254903, 0.37254903, 1.0]);
 
     //Load a wolf mesh from a Collada file to verify drawMesh works
-    this.wolfLoader = new CLoader("./assets/mesh/wolf.dae");
+    //this.wolfLoader = new CLoader("./assets/mesh/wolf.dae");
+    this.wolfLoader = new CLoader("./assets/mesh/wolfAnimated.dae");
     this.wolfLoader.load(() => {
       if (this.wolfLoader && this.wolfLoader.meshes.length > 0) {
         this.wolfMesh = this.wolfLoader.meshes[0];
@@ -306,38 +309,65 @@ export class MinecraftAnimation extends CanvasAnimation {
     for (const mob of mobs) {
       // direction in XZ plane - seek the player so should be PlayerPos - MobPos
       let dx = player.x - mob.center.x;
-      let dy = player.y - mob.center.y;
       let dz = player.z - mob.center.z; // remember [x, z, y]
+
+      //let dy = player.y - mob.center.y;
       //dx += (Math.random() - 0.5) * 0.2;
       //dz += (Math.random() - 0.5) * 0.2; // make it more random
 
       const dist = Math.sqrt(dx*dx + dz*dz);
 
-      if (dist < 0.001) continue;
+      if (dist < 20.0) continue;
 
       dx /= dist; // normalize
-      dy /= dist;
+      //dy /= dist;
       dz /= dist;
 
-      const speed = 0.05; // change later
+      const speed = 0.05;
+      const verticalVelocity = mob.velocity.y;
       mob.velocity = new Vec3([
         dx*speed, 
-        dy*speed, 
-        dz*speed, // FIX: add vertical velocity later when mobs are blocked by cubes
+        verticalVelocity, 
+        dz*speed,
       ]);
-      let targetAngle = Math.atan2(dz, dx);
-      let current = mob.orientation;
-      mob.orientation += 0.1 * (targetAngle - current); // make turning smooth
-      //mob.orientation = Math.atan2(dx, dz); // want mob to face player
+
+      // face movement direction with angular interpolation
+      const targetAngle = Math.atan2(dz, dx);
+      const angleDelta = Math.atan2(
+        Math.sin(targetAngle - mob.orientation), 
+        Math.cos(targetAngle - mob.orientation),
+      );
+      mob.orientation += 0.2 * angleDelta;
     }
   }
 
   private updateMobPositions(mobs: Mob[]){
-    for (const mob of mobs) {
+    const gravity = 0.02;
+    const terminalFallSpeed = -0.8;
+    const mobRadius = 0.45;
+    const mobHeight = 1.3;
+
+    for (const mob of mobs) { // horizontal movement towards player
       mob.center.x += mob.velocity.x;
-      mob.center.y += mob.velocity.y;
+      //mob.center.y += mob.velocity.y;
       mob.center.z += mob.velocity.z;
-      // mob.center z stays the same FIX
+
+      // gravity + ground collision
+      mob.velocity.y = Math.max(mob.velocity.y - gravity, terminalFallSpeed);
+      const nextY = mob.center.y + mob.velocity.y;
+      let blocked = false;
+      for (const chunk of this.chunks.values()){
+        if (chunk.isColliding(mob.center.x, nextY, mob.center.z, mobRadius, mobHeight)) {
+          blocked = true;
+          break;
+        }
+      }
+
+      if (blocked && mob.velocity.y <=0){
+        mob.velocity.y = 0;
+      } else{
+        mob.center.y = nextY;
+      }
     }
   }
 
@@ -857,6 +887,7 @@ export class MinecraftAnimation extends CanvasAnimation {
     const now = performance.now();
     const dt = Math.min((now - this.lastTime) / 1000, 0.05);
     this.lastTime = now;
+    this.mobAnimationTime += dt * 1.5;
     
     // Logic for a rudimentary walking simulator. Check for collisions and reject attempts to walk into a cube.
     const walkDir = this.gui.walkDir();
@@ -992,7 +1023,8 @@ export class MinecraftAnimation extends CanvasAnimation {
       for (const mob of allMobs){
         positions.push(mob.center);
         //const q = new Quat().setIdentity();
-        const q = Quat.fromAxisAngle(new Vec3([0, 1, 0]), mob.orientation + Math.PI / 2);
+        const q = Quat.fromAxisAngle(new Vec3([0, 1, 0]), mob.orientation + this.WOLF_FACING_OFFSET);
+        
         rotations.push(q);
       }
       this.drawMesh(this.wolfMesh, positions, rotations);
@@ -1376,6 +1408,11 @@ export class MinecraftAnimation extends CanvasAnimation {
       this.meshRenderPasses.set(mesh, entry);
     }
 
+    if (mesh.animations.length > 0) {
+      const animatedPositions = this.computeAnimatedVertexPositions(mesh, this.mobAnimationTime, 0);
+      entry.pass.updateAttributeBuffer("aVertPos", animatedPositions);
+    }
+
     const offs = new Float32Array(n * 3);
     const rots = new Float32Array(n * 4);
     for (let i = 0; i < n; i++) {
@@ -1402,6 +1439,65 @@ export class MinecraftAnimation extends CanvasAnimation {
     entry.pass.drawInstanced(n);
     gl.enable(gl.CULL_FACE);
   }
+
+
+  
+  private computeAnimatedVertexPositions(mesh: Mesh, time: number, clipIndex: number): Float32Array {
+    const geo = mesh.geometry;
+    const vertexCount = geo.position.count;
+    const out = new Float32Array(vertexCount * 3);
+
+    const skinMatrices = mesh.computeSkinMatrices(time, clipIndex);
+    const boneMats: Mat4[] = [];
+    for (let b = 0; b < mesh.bones.length; b++) {
+      const o = b * 16;
+      boneMats.push(new Mat4(Array.from(skinMatrices.subarray(o, o + 16))));
+    }
+
+    const vAttrs = [geo.v0.values, geo.v1.values, geo.v2.values, geo.v3.values];
+    const skinIndex = geo.skinIndex.values;
+    const skinWeight = geo.skinWeight.values;
+
+    for (let i = 0; i < vertexCount; i++) {
+      const i3 = 3 * i;
+      const i4 = 4 * i;
+      let px = 0;
+      let py = 0;
+      let pz = 0;
+      let totalWeight = 0;
+
+      for (let j = 0; j < 4; j++) {
+        const w = skinWeight[i4 + j];
+        if (w <= 0) continue;
+
+        const boneIndex = Math.max(0, Math.min(mesh.bones.length - 1, Math.round(skinIndex[i4 + j])));
+        const v = vAttrs[j];
+        const transformed = boneMats[boneIndex].multiplyPt3(
+          new Vec3([v[i3], v[i3 + 1], v[i3 + 2]]),
+        );
+
+        px += transformed.x * w;
+        py += transformed.y * w;
+        pz += transformed.z * w;
+        totalWeight += w;
+      }
+
+      if (totalWeight > 0) {
+        out[i3] = px / totalWeight;
+        out[i3 + 1] = py / totalWeight;
+        out[i3 + 2] = pz / totalWeight;
+      } else {
+        out[i3] = geo.position.values[i3];
+        out[i3 + 1] = geo.position.values[i3 + 1];
+        out[i3 + 2] = geo.position.values[i3 + 2];
+      }
+    }
+
+    return out;
+  }
+
+
+
 
 
   public jump() {
